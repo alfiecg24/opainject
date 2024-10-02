@@ -23,7 +23,6 @@
 #import <sys/wait.h>
 #import <CoreFoundation/CoreFoundation.h>
 
-#import "pac.h"
 #import "dyld.h"
 #import "sandbox.h"
 #import "CoreSymbolication.h"
@@ -31,7 +30,7 @@
 #import "thread_utils.h"
 #import "arm64.h"
 
-vm_address_t writeStringToTask(task_t task, const char* string, size_t* lengthOut)
+static vm_address_t writeStringToTask(task_t task, const char* string, size_t* lengthOut)
 {
 	kern_return_t kr = KERN_SUCCESS;
 	vm_address_t remoteString = (vm_address_t)NULL;
@@ -68,38 +67,16 @@ vm_address_t writeStringToTask(task_t task, const char* string, size_t* lengthOu
 	return remoteString;
 }
 
-void findRopLoop(task_t task, vm_address_t allImageInfoAddr)
+static void findRopLoop(task_t task, vm_address_t allImageInfoAddr)
 {
 	uint32_t inst = CFSwapInt32(0x00000014);
 	ropLoop = (uint64_t)scanLibrariesForMemory(task, allImageInfoAddr, (char*)&inst, sizeof(inst), 4);
 }
 
 // Create an infinitely spinning pthread in target process
-kern_return_t createRemotePthread(task_t task, vm_address_t allImageInfoAddr, thread_act_t* remotePthreadOut)
+static kern_return_t createRemotePthread(task_t task, vm_address_t allImageInfoAddr, thread_act_t* remotePthreadOut)
 {
 	kern_return_t kr = KERN_SUCCESS;
-
-#if __arm64e__
-	// GET ANY VALID THREAD STATE
-	mach_msg_type_number_t validThreadStateCount = ARM_THREAD_STATE64_COUNT;
-	struct arm_unified_thread_state validThreadState;
-	thread_act_array_t allThreadsForFindingValid;
-	mach_msg_type_number_t threadCountForFindingValid;
-	kr = task_threads(task, &allThreadsForFindingValid, &threadCountForFindingValid);
-	if(kr != KERN_SUCCESS || threadCountForFindingValid == 0)
-	{
-		printf("[createRemotePthread] ERROR: failed to get threads in task: %s\n", mach_error_string(kr));
-		if (kr == KERN_SUCCESS) return 1;
-		return kr;
-	}
-	kr = thread_get_state(allThreadsForFindingValid[0], ARM_THREAD_STATE64, (thread_state_t)&validThreadState.ts_64, &validThreadStateCount);
-	if(kr != KERN_SUCCESS )
-	{
-		printf("[createRemotePthread] ERROR: failed to get valid thread state: %s\n", mach_error_string(kr));
-		return kr;
-	}
-	vm_deallocate(mach_task_self(), (vm_offset_t)allThreadsForFindingValid, sizeof(thread_act_array_t) * threadCountForFindingValid);
-#endif
 
 	// GATHER OFFSETS
 	__unused vm_address_t libSystemPthreadAddr = getRemoteImageAddress(task, allImageInfoAddr, "/usr/lib/system/libsystem_pthread.dylib");
@@ -156,19 +133,11 @@ kern_return_t createRemotePthread(task_t task, vm_address_t allImageInfoAddr, th
 	// spawn pthread to infinite loop
 	bootstrapThreadState.ash.flavor = ARM_THREAD_STATE64;
 	bootstrapThreadState.ash.count = ARM_THREAD_STATE64_COUNT;
-#if __arm64e__
-	bootstrapThreadState.ts_64.__opaque_flags = validThreadState.ts_64.__opaque_flags;
-#endif
 	uint64_t sp = (remoteStack64 + (STACK_SIZE / 2));
 	__unused uint64_t x2 = ropLoop;
-#if __arm64e__
-	if (!(bootstrapThreadState.ts_64.__opaque_flags & __DARWIN_ARM_THREAD_STATE64_FLAGS_NO_PTRAUTH)) {
-		x2 = (uint64_t)make_sym_callable((void*)x2);
-	}
-#endif
 	__darwin_arm_thread_state64_set_sp(bootstrapThreadState.ts_64, (void*)sp);
-	__darwin_arm_thread_state64_set_pc_fptr(bootstrapThreadState.ts_64, make_sym_callable((void*)_pthread_set_self));
-	__darwin_arm_thread_state64_set_lr_fptr(bootstrapThreadState.ts_64, make_sym_callable((void*)ropLoop)); //when done, go to infinite loop
+	__darwin_arm_thread_state64_set_pc_fptr(bootstrapThreadState.ts_64, (void*)_pthread_set_self);
+	__darwin_arm_thread_state64_set_lr_fptr(bootstrapThreadState.ts_64, (void*)ropLoop); //when done, go to infinite loop
 	bootstrapThreadState.ts_64.__x[0] = mainThread;
 
 	//printThreadState_state(bootstrapThreadState);
@@ -197,7 +166,7 @@ kern_return_t createRemotePthread(task_t task, vm_address_t allImageInfoAddr, th
 	return kr;
 }
 
-kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut, bool willReturn, vm_address_t funcPtr, int numArgs, ...)
+static kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut, bool willReturn, vm_address_t funcPtr, int numArgs, ...)
 {
 	kern_return_t kr = KERN_SUCCESS;
 	if(numArgs > 8)
@@ -268,8 +237,8 @@ kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut, 
 	struct arm_unified_thread_state newState = origThreadState;
 	uint64_t sp = remoteStack + (STACK_SIZE / 2);
 	__darwin_arm_thread_state64_set_sp(newState.ts_64, (void*)sp);
-	__darwin_arm_thread_state64_set_pc_fptr(newState.ts_64, make_sym_callable((void*)funcPtr));
-	__darwin_arm_thread_state64_set_lr_fptr(newState.ts_64, make_sym_callable((void*)ropLoop));
+	__darwin_arm_thread_state64_set_pc_fptr(newState.ts_64, (void*)funcPtr);
+	__darwin_arm_thread_state64_set_lr_fptr(newState.ts_64, (void*)ropLoop);
 
 	// write arguments into registers
 	for (int i = 0; i < numArgs; i++)
@@ -354,7 +323,7 @@ kern_return_t arbCall(task_t task, thread_act_t targetThread, uint64_t* retOut, 
 	return kr;
 }
 
-void prepareForMagic(task_t task, vm_address_t allImageInfoAddr)
+static void prepareForMagic(task_t task, vm_address_t allImageInfoAddr)
 {
 	// FIND INFINITE LOOP ROP GADGET
 	static dispatch_once_t onceToken;
@@ -364,59 +333,6 @@ void prepareForMagic(task_t task, vm_address_t allImageInfoAddr)
 	printf("[prepareForMagic] done, ropLoop: 0x%llX\n", ropLoop);
 }
 
-bool sandboxFixup(task_t task, thread_act_t pthread, pid_t pid, const char* dylibPath, vm_address_t allImageInfoAddr)
-{
-	int readExtensionNeeded = sandbox_check(pid, "file-read-data", SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, dylibPath);
-	int executableExtensionNeeded = sandbox_check(pid, "file-map-executable", SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT, dylibPath);
-
-	int retval = 0;
-	vm_address_t libSystemSandboxAddr = 0;
-	uint64_t sandbox_extension_consumeAddr = 0;
-	if (readExtensionNeeded || executableExtensionNeeded) {
-		libSystemSandboxAddr = getRemoteImageAddress(task, allImageInfoAddr, "/usr/lib/system/libsystem_sandbox.dylib");
-		sandbox_extension_consumeAddr = remoteDlSym(task, libSystemSandboxAddr, "_sandbox_extension_consume");
-		printf("[sandboxFixup] applying sandbox extension(s)! sandbox_extension_consume: 0x%llX\n", sandbox_extension_consumeAddr);
-	}
-
-	if (readExtensionNeeded) {
-		char* extString = sandbox_extension_issue_file(APP_SANDBOX_READ, dylibPath, 0);
-		size_t remoteExtStringSize = 0;
-		vm_address_t remoteExtString = writeStringToTask(task, (const char*)extString, &remoteExtStringSize);
-		if(remoteExtString)
-		{
-			int64_t readExtensionRet = 0;
-			arbCall(task, pthread, (uint64_t*)&readExtensionRet, true, sandbox_extension_consumeAddr, 1, remoteExtString);
-			vm_deallocate(task, remoteExtString, remoteExtStringSize);
-
-			printf("[sandboxFixup] sandbox_extension_consume returned %lld for read extension\n", (int64_t)readExtensionRet);
-			retval |= (readExtensionRet <= 0);
-		}
-	}
-	else {
-		printf("[sandboxFixup] read extension not needed, skipping...\n");
-	}
-
-	if (executableExtensionNeeded) {
-		char* extString = sandbox_extension_issue_file("com.apple.sandbox.executable", dylibPath, 0);
-		size_t remoteExtStringSize = 0;
-		vm_address_t remoteExtString = writeStringToTask(task, (const char*)extString, &remoteExtStringSize);
-		if(remoteExtString)
-		{
-			int64_t executableExtensionRet = 0;
-			arbCall(task, pthread, (uint64_t*)&executableExtensionRet, true, sandbox_extension_consumeAddr, 1, remoteExtString);
-			vm_deallocate(task, remoteExtString, remoteExtStringSize);
-
-			printf("[sandboxFixup] sandbox_extension_consume returned %lld for executable extension\n", (int64_t)executableExtensionRet);
-			retval |= (executableExtensionRet <= 0);
-		}
-	}
-	else {
-		printf("[sandboxFixup] executable extension not needed, skipping...\n");
-	}
-
-	return retval == 0;
-}
-
 void injectDylibViaRop(task_t task, pid_t pid, const char* dylibPath, vm_address_t allImageInfoAddr)
 {
 	prepareForMagic(task, allImageInfoAddr);
@@ -424,8 +340,6 @@ void injectDylibViaRop(task_t task, pid_t pid, const char* dylibPath, vm_address
 	thread_act_t pthread = 0;
 	kern_return_t kr = createRemotePthread(task, allImageInfoAddr, &pthread);
 	if(kr != KERN_SUCCESS) return;
-
-	sandboxFixup(task, pthread, pid, dylibPath, allImageInfoAddr);
 
 	printf("[injectDylibViaRop] Preparation done, now injecting!\n");
 
